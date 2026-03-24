@@ -25,10 +25,10 @@ A Django REST API that maintains a wallet for each client. Admin users can credi
 ## Tech Stack
 
 - **Python** 3.10+
-- **Django** 4.x
+- **Django** 6.x
 - **Django REST Framework** 3.x
 - **SQLite** (default, can be swapped for PostgreSQL)
-- **requests** (for external fulfillment API)
+- **urllib (stdlib)** for external fulfillment API calls
 
 ---
 
@@ -81,7 +81,7 @@ venv\Scripts\activate
 ### 3. Install dependencies
 
 ```bash
-pip install django djangorestframework requests
+pip install django djangorestframework
 ```
 
 Or if you have a `requirements.txt`:
@@ -94,7 +94,6 @@ pip install -r requirements.txt
 ```
 django
 djangorestframework
-requests
 ```
 
 ### 4. Configure `settings.py`
@@ -205,11 +204,37 @@ Represents a client's order linked to a wallet deduction.
 |---|---|---|
 | `id` | UUID | Auto-generated primary key |
 | `client` | ForeignKey | Linked client |
+| `idempotency_key` | CharField | Client-provided key for idempotent create-order retries |
 | `amount` | DecimalField | Order amount |
 | `status` | CharField | `pending`, `fulfilled`, or `failed` |
 | `fulfillment_id` | CharField | ID returned by external fulfillment API |
+| `refunded` | BooleanField | `true` when automatic refund is issued after terminal fulfillment failure |
 | `created_at` | DateTimeField | Created timestamp |
 | `updated_at` | DateTimeField | Last updated timestamp |
+
+### `FulfillmentJob`
+Asynchronous job record for processing order fulfillment.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | UUID | Auto-generated primary key |
+| `order` | OneToOneField | Linked order |
+| `status` | CharField | `pending`, `processing`, `completed`, or `failed` |
+| `attempts` | PositiveIntegerField | Number of fulfillment attempts made |
+| `last_error` | TextField | Last failure reason (if any) |
+| `created_at` | DateTimeField | Created timestamp |
+| `updated_at` | DateTimeField | Last updated timestamp |
+
+### `OrderEvent`
+Structured event log for order lifecycle observability.
+
+| Field | Type | Description |
+|---|---|---|
+| `id` | UUID | Auto-generated primary key |
+| `order` | ForeignKey | Linked order |
+| `event_type` | CharField | Event name (`order_created`, `fulfillment_attempt`, etc.) |
+| `payload` | JSONField | Structured metadata for the event |
+| `created_at` | DateTimeField | Timestamp |
 
 ---
 
@@ -304,7 +329,7 @@ Content-Type: application/json
 
 ### 3. Client – Create Order
 
-Validates wallet balance, atomically deducts the amount, creates an order, calls the fulfillment API, and stores the returned fulfillment ID.
+Validates wallet balance, atomically deducts the amount, creates an order, enqueues asynchronous fulfillment, and returns immediately. Fulfillment status and `fulfillment_id` are updated in the background.
 
 **Endpoint**
 ```
@@ -315,6 +340,7 @@ POST /orders
 ```
 Content-Type: application/json
 client-id: 3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+idempotency-key: a-unique-key-generated-by-client
 ```
 
 **Request Body**
@@ -330,12 +356,27 @@ client-id: 3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   "order_id": "a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "client_id": "3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "amount": "50.00",
-  "status": "fulfilled",
-  "fulfillment_id": "101"
+  "status": "pending",
+  "fulfillment_id": null,
+  "refunded": false,
+  "idempotent_replay": false
 }
 ```
 
-> **Note:** `fulfillment_id` is the `id` returned by the external fulfillment API (`jsonplaceholder.typicode.com`). It will always return `101` for this mock API.
+**Idempotent Replay Response** `200 OK` (same key + same client)
+```json
+{
+  "order_id": "a1b2c3d4-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "client_id": "3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+  "amount": "50.00",
+  "status": "pending",
+  "fulfillment_id": null,
+  "refunded": false,
+  "idempotent_replay": true
+}
+```
+
+> **Note:** `fulfillment_id` is stored after asynchronous fulfillment succeeds.
 
 **Order Status Values**
 
@@ -343,17 +384,17 @@ client-id: 3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx
 |---|---|
 | `pending` | Order created, fulfillment in progress |
 | `fulfilled` | Fulfillment API responded successfully |
-| `failed` | Fulfillment API call failed |
+| `failed` | Fulfillment failed after retries (order is auto-refunded) |
 
 **Error Responses**
 
 | Status | Reason | Response |
 |---|---|---|
 | `400` | Missing `client-id` header | `{"error": "client-id header is required."}` |
+| `400` | Missing `idempotency-key` header | `{"error": "idempotency-key header is required."}` |
 | `400` | Insufficient balance | `{"error": "Insufficient wallet balance."}` |
 | `400` | Invalid amount | `{"amount": ["Ensure this value is greater than or equal to 0.01."]}` |
 | `404` | Client not found | `{"error": "Client not found."}` |
-| `404` | Wallet not found | `{"error": "Wallet not found for client."}` |
 
 ---
 
@@ -385,6 +426,7 @@ client-id: 3f6c2b1a-xxxx-xxxx-xxxx-xxxxxxxxxxxx
   "amount": "50.00",
   "status": "fulfilled",
   "fulfillment_id": "101",
+  "refunded": false,
   "created_at": "2024-01-15T10:30:00Z",
   "updated_at": "2024-01-15T10:30:05Z"
 }
@@ -467,11 +509,12 @@ Copy the UUID printed. You will use it in every request.
 - Headers:
   - `Content-Type: application/json`
   - `client-id: <your-uuid>`
+  - `idempotency-key: <unique-key-per-create-request>`
 - Body → raw → JSON:
 ```json
 { "amount": 50 }
 ```
-Copy the `order_id` from the response.
+Copy the `order_id` from the response. The initial status will usually be `pending`; fulfillment is processed asynchronously.
 
 #### Step 5 — Get order details
 - Method: `GET`
@@ -491,9 +534,10 @@ Copy the `order_id` from the response.
 | 5 | Debit more than available balance | `400` — insufficient funds |
 | 6 | Check wallet balance | `200` — correct balance returned |
 | 7 | Check balance without `client-id` header | `400` — header required |
-| 8 | Create order within balance | `201` — order fulfilled |
+| 8 | Create order within balance | `201` — order created (status starts as `pending`) |
 | 9 | Create order exceeding balance | `400` — insufficient funds |
 | 10 | Create order without `client-id` header | `400` — header required |
+| 10a | Create order without `idempotency-key` header | `400` — header required |
 | 11 | Get order details with correct client | `200` — full order info |
 | 12 | Get order details with wrong client | `404` — not found |
 | 13 | Get non-existent order | `404` — not found |
@@ -520,8 +564,17 @@ Wallet balance checks and deductions use `select_for_update()` inside `transacti
 ### Ledger Pattern
 Every credit and debit creates an immutable `LedgerEntry` record with the `balance_after` stored. This provides a full audit trail and allows balance reconciliation at any point in time.
 
-### Fulfillment API Outside Transaction
-The HTTP call to the external fulfillment API happens **after** the database transaction commits. This prevents holding a database row lock during a slow or failing network call. If fulfillment fails, the order is marked `failed` but the wallet deduction stands — a refund or retry mechanism can be layered on top for production use.
+### Async Fulfillment and Retry Strategy
+Order creation commits quickly and enqueues a background fulfillment job. The fulfillment worker uses retry with exponential backoff and a lightweight circuit breaker to handle provider instability while keeping API latency low.
+
+### Automatic Reconciliation on Terminal Failure
+If fulfillment still fails after all retries, the order is marked `failed`, the wallet is automatically refunded inside a transaction, and a compensating credit ledger entry is written.
+
+### Idempotent Order Creation
+`POST /orders` requires an `idempotency-key` header. Repeating the same request with the same key for the same client returns the original order response and prevents duplicate wallet deductions.
+
+### Structured Observability
+`OrderEvent` records structured lifecycle events (`order_created`, `fulfillment_queued`, attempts, success/failure, and refund) for operational debugging and auditing.
 
 ### Client Isolation on Orders
 `GET /orders/{order_id}` filters by both `order_id` AND `client-id` header simultaneously. This ensures clients cannot access or enumerate each other's orders.
@@ -532,6 +585,7 @@ CSRF protection is designed for browser-based form submissions. Since this is a 
 ### Separation of Concerns
 - **`models.py`** — data layer only
 - **`services.py`** — all business logic (wallet operations, order creation, fulfillment calls)
+- **`services.py`** — all business logic (wallet operations, order creation, async fulfillment processing, retries, refunds)
 - **`views.py`** — HTTP request/response handling only
 - **`serializers.py`** — input validation only
 

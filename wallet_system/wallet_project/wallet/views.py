@@ -1,4 +1,3 @@
-from django.core.exceptions import ObjectDoesNotExist
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
@@ -7,7 +6,7 @@ from django.views.decorators.csrf import csrf_exempt
 
 from .models import Client, Wallet, Order
 from .serializers import CreditDebitSerializer, CreateOrderSerializer, OrderSerializer
-from .services import credit_wallet, debit_wallet, create_order
+from .services import credit_wallet, debit_wallet, create_order_with_idempotency
 
 @method_decorator(csrf_exempt, name='dispatch')
 class AdminCreditWalletView(APIView):
@@ -51,21 +50,24 @@ class CreateOrderView(APIView):
         client_id = request.headers.get('client-id')
         if not client_id:
             return Response({"error": "client-id header is required."}, status=status.HTTP_400_BAD_REQUEST)
+        idempotency_key = request.headers.get('idempotency-key')
+        if not idempotency_key:
+            return Response({"error": "idempotency-key header is required."}, status=status.HTTP_400_BAD_REQUEST)
 
         serializer = CreateOrderSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            result = create_order(
+            result = create_order_with_idempotency(
                 client_id=client_id,
                 amount=serializer.validated_data['amount'],
+                idempotency_key=idempotency_key,
             )
-            return Response(result, status=status.HTTP_201_CREATED)
+            response_status = status.HTTP_200_OK if result.get("idempotent_replay") else status.HTTP_201_CREATED
+            return Response(result, status=response_status)
         except Client.DoesNotExist:
             return Response({"error": "Client not found."}, status=status.HTTP_404_NOT_FOUND)
-        except (Wallet.DoesNotExist, ObjectDoesNotExist):
-            return Response({"error": "Wallet not found for client."}, status=status.HTTP_404_NOT_FOUND)
         except ValueError as e:
             return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
