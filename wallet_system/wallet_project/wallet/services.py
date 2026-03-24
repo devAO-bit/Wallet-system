@@ -54,6 +54,8 @@ def debit_wallet(client_id: str, amount: Decimal) -> dict:
 
     with transaction.atomic():
         client = Client.objects.select_for_update().get(id=client_id)
+        wallet, _ = Wallet.objects.get_or_create(client=client)
+        # Re-fetch wallet with lock (works for both existing and newly created wallets)
         wallet = Wallet.objects.select_for_update().get(client=client)
 
         if wallet.balance < amount:
@@ -84,6 +86,8 @@ def create_order(client_id: str, amount: Decimal) -> dict:
 
     with transaction.atomic():
         client = Client.objects.select_for_update().get(id=client_id)
+        wallet, _ = Wallet.objects.get_or_create(client=client)
+        # Re-fetch wallet with lock (works for both existing and newly created wallets)
         wallet = Wallet.objects.select_for_update().get(client=client)
 
         if wallet.balance < amount:
